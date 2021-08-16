@@ -1,0 +1,887 @@
+---
+title: "Analysis script for 'Behavioral analysis of habit formation in modern slot machine gambling'"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Setup and data preparation
+
+```{r setup, include = FALSE}
+
+library(dplyr)
+library(ggplot2)
+source("habit_functions.R")
+
+setwd("C:/") # set to the working directory
+if (!file.exists('results')) {dir.create('results')}
+
+dv_labels = c("Robust (no interactions)", "Robust", "OLS")
+
+```
+
+
+```{r data preparation}
+  
+GHS1 <- read.csv("habit_data.csv", header = TRUE)
+
+# saved for the calculation of round final balances / lengths
+GHS1_sum <- GHS1[, c("Participant.ID", "Session", "Sequence.Version", 
+                     "Round.End.Balance", "Time.Elapsed", "Initiated.Trial.Number")]
+
+# remove 4 trials where the collect button was pressed, which required the game to be unlocked by the researcher
+GHS1 <- subset(GHS1, Participant.ID != 25 | Session != 1 | Trial.Number != 9)
+GHS1 <- subset(GHS1, Participant.ID != 13 | Session != 1 | Trial.Number != 59)
+GHS1 <- subset(GHS1, Participant.ID != 52 | Session != 3 | Trial.Number != 112)
+GHS1 <- subset(GHS1, Participant.ID != 41 | Session != 1 | Trial.Number != 63)
+
+# remove trials at session start/end and before/during/after free spins
+GHS1 <- subset(GHS1, First.Trial != 1 & Last.Trial != 1 & Before.Free.Spin != 1 & Free.Spin.Round != 1 & After.Free.Spin != 1)
+
+# Create binary variables
+GHS1$Is.Win <- ifelse(GHS1$Result > 0, 1, 0)
+GHS1$Next.Bet.Changed <- ifelse(GHS1$Next.bet.amount != GHS1$Round.Bet, 1, 0)
+GHS1$Bonus.Exceeded <- ifelse(GHS1$Round.End.Balance > 5500, 1, 0)
+
+# create factor variables
+GHS1$Participant.f <- factor(GHS1$Participant.ID)
+GHS1$Sequence.Version <- factor(GHS1$Sequence.Version)
+GHS1$Trial.Type <- factor(GHS1$Outcome...Bet + GHS1$Outcome...Zero, levels = c(0,1,2), 
+                          labels = c("Losses", "Losses Disguised as Wins", "Wins"))
+
+# variable transformations
+GHS1$Session.one <- GHS1$Session - 1
+GHS1$Session.cent <- GHS1$Session - 2
+GHS1$Session.three <- GHS1$Session - 3
+GHS1$Initiated.Trial.Number.50 <- GHS1$Initiated.Trial.Number - 50
+GHS1$Initiated.Trial.Number.cent <- GHS1$Initiated.Trial.Number - 100
+GHS1$Initiated.Trial.Number.150 <- GHS1$Initiated.Trial.Number - 150
+GHS1$Time.Until.Next.Bet.ms <- GHS1$Time.Until.Next.Bet*1000 # conversion to ms here
+GHS1$Time.Until.Next.Bet.log <- log(GHS1$Time.Until.Next.Bet.ms)
+GHS1$Loss.Streak.Outcome...Zero.log <- log(GHS1$Loss.Streak.Outcome...Zero)
+GHS1$Result.log <- log(GHS1$Result)
+
+# subsets for wins and losses
+windata <- subset(GHS1,Result > 0 )
+lossdata <- subset(GHS1, Result == 0)
+
+# outlier removal for SIL
+GHS1_trim <- subset(GHS1, Time.Until.Next.Bet < 10)
+windata_trim <- subset(GHS1_trim,Result > 0 )
+lossdata_trim <- subset(GHS1_trim, Result == 0)
+
+# calculate percentage of removed trials
+paste("Trials trimmed overall:", round((nrow(GHS1) - nrow(GHS1_trim)) / nrow(GHS1) * 100, 2), "%")
+paste("Win trials trimmed:", round((nrow(windata) - nrow(windata_trim)) / nrow(windata) * 100, 2), "%")
+paste("Loss trials trimmed:", round((nrow(lossdata) - nrow(lossdata_trim)) / nrow(lossdata) * 100, 2), "%")
+
+# calculate percentage of removed trials per session
+for (i in c(1, 2, 3)) {
+  print(paste("Trials trimmed from session", i, "=",  
+              round((sum(GHS1$Session == i) - sum(GHS1_trim$Session == i)) / sum(GHS1$Session == i) * 100, 2), "%"))
+  }
+
+# Grand mean centering (GMC)
+GHS1 <- GHS1 %>% mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE))
+GHS1_trim <- GHS1_trim %>% mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE))
+
+windata <- windata %>% 
+  mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE)) %>%
+  mutate(Result.log.gmc = Result.log - mean(Result.log, na.rm = TRUE))
+
+windata_trim <- windata_trim %>% 
+  mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE)) %>%
+  mutate(Result.log.gmc = Result.log - mean(Result.log, na.rm = TRUE))
+
+lossdata <- lossdata %>% 
+  mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE)) %>%
+  mutate(Loss.Streak.Outcome...Zero.log.gmc = Loss.Streak.Outcome...Zero.log - mean(Loss.Streak.Outcome...Zero.log, na.rm = TRUE))
+
+lossdata_trim <- lossdata_trim %>% 
+  mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE)) %>%
+  mutate(Loss.Streak.Outcome...Zero.log.gmc = Loss.Streak.Outcome...Zero.log - mean(Loss.Streak.Outcome...Zero.log, na.rm = TRUE))
+
+```
+
+
+## Descriptives Tables
+
+```{r session descriptives}
+
+sessions_descriptives <- function() {
+  # number of trials
+  session_n <- tapply(GHS1$Trial.Type, GHS1$Session, function(x){length(x)})
+
+  # categorical counts
+  cat_fun <- function(x, type){stringr::str_c(sum(x == type), " (", round(sum(x == type)/length(x)*100,2), "%)")}
+  sum_fun <- function(x){stringr::str_c(sum(x), " (", round(sum(x)/length(x)*100,2), "%)")}
+
+  Losses <- tapply(GHS1$Trial.Type, GHS1$Session, cat_fun, type = "Losses")
+  LDWs <- tapply(GHS1$Trial.Type, GHS1$Session, cat_fun, type =  "Losses Disguised as Wins")
+  Wins <- tapply(GHS1$Trial.Type, GHS1$Session, cat_fun, type = "Wins")
+  bet_switches <- tapply(GHS1$Next.Bet.Changed, GHS1$Session, sum_fun)
+  exceed_bonus <- tapply(GHS1$Bonus.Exceeded, GHS1$Session, sum_fun)
+  
+  # Continuous variables
+  cont_fun <- function(x){stringr::str_c(round(mean(x, na.rm = TRUE),2), " (", 
+                                         round(sd(x, na.rm = TRUE),2), ")")}
+  bal_fun <- function(x) {return(stringr::str_c(round(mean(x, na.rm = TRUE),2), " (", 
+                                                round(sd(x, na.rm = TRUE),2), ")"))}
+  sess_fun <- function(x) {return(stringr::str_c(round(mean(x, na.rm = TRUE)/60,2), " (", 
+                                                 round(sd(x, na.rm = TRUE)/60,2), ")"))}
+  
+  SIL.avg <- tapply(GHS1$Time.Until.Next.Bet, GHS1$Session, cont_fun)
+  bet_denom.avg <- tapply(GHS1$Bet.Denomination, GHS1$Session, cont_fun)
+  lines.avg <- tapply(GHS1$Lines, GHS1$Session, cont_fun)
+  bet_size.avg <- tapply(GHS1$Round.Bet, GHS1$Session, cont_fun)
+  cred_bal.avg <- tapply(GHS1$Round.End.Balance , GHS1$Session, cont_fun)
+  loss_streak.avg <- tapply(lossdata$Loss.Streak.Outcome...Zero, lossdata$Session, cont_fun)
+  win_mag.avg <- tapply(windata$Result, windata$Session, cont_fun)
+  
+  bal <- tapply(GHS1_sum$Round.End.Balance, list(GHS1_sum$Participant.ID, GHS1_sum$Session), function(x){tail(x, n = 1)})
+  final_bal <- c(bal_fun(bal[,1]), bal_fun(bal[,2]), bal_fun(bal[,3]))
+  
+  lengths <- tapply(GHS1_sum$Time.Elapsed, list(GHS1_sum$Participant.ID, GHS1_sum$Session), function(x){tail(x, n = 1)})
+  session_length <- c(sess_fun(lengths[,1]), sess_fun(lengths[,2]), sess_fun(lengths[,3]))
+  
+  descriptives <- rbind(c(""),
+                        t(Losses), t(LDWs), t(Wins), t(bet_switches), t(exceed_bonus),
+                        c(""),
+                        t(SIL.avg), t(bet_denom.avg), t(lines.avg), 
+                        t(bet_size.avg), t(loss_streak.avg), t(win_mag.avg), 
+                        t(cred_bal.avg), t(final_bal), t(session_length))
+  
+  colnames(descriptives) <- c(stringr::str_c("1 (n = ", session_n[1], ")"), 
+                              stringr::str_c("2 (n = ", session_n[2], ")"), 
+                              stringr::str_c("3 (n = ", session_n[3], ")"))
+  
+  rownames(descriptives) <- c("Categorical Variable Counts and Percentages", 
+                              "Losses", "Losses Disguised as Wins", "Wins", "Bet Switches", "Credits Exceeded $15 Bonus",
+                              "Numeric Variable Means and Standard Deviations",
+                              "Spin Initiation Latency (sec)", "Bet Denomination (credits)", "Lines Played", 
+                              "Total Bet Size (credits)", "Loss Streak Length", "Win Magnitude (credits)", 
+                              "Credit Balance", "Final Credit Balance","Session Length (min)")
+  
+  return(descriptives)
+}
+
+sessions <- sessions_descriptives()
+print(xtable::xtable(sessions), type = "html", file = "results/sessions.html")
+
+# Check to ensure all participants experienced wins or LDWs in each session, before trimming
+win_count <- aggregate(Result ~ Participant.f + Session, data = GHS1, function(x) {sum(x > 0)})
+sessionDesc(win_count, "Result", "Session")
+psych::describeBy(win_count$Result, win_count$Session, mat = TRUE) 
+
+# check for the number of wins/losses after trimming
+win_trials_per_p <- dplyr::count(windata_trim, Participant.f, Session)
+loss_trials_per_p <- dplyr::count(lossdata_trim, Participant.f, Session)
+
+# determines whether some sessions with incomplete and the mean completed trials
+init_trials <- tapply(GHS1_sum$Initiated.Trial.Number, 
+                      list(GHS1_sum$Participant.ID, GHS1_sum$Session), 
+                      function(x){tail(x, n = 1)})
+
+paste("There were", sum(init_trials < 200, na.rm = TRUE), "incomplete sessions")
+paste("Mean # of trials for incomplete sessions:", round(mean(init_trials[!init_trials %in% 200], na.rm = TRUE), 2))
+
+```
+
+
+```{r sequence descriptives}
+
+sequence_descriptives <- function() {
+  # number of trials
+  session_n <- tapply(GHS1$Trial.Type, GHS1$Sequence, function(x){length(x)})
+  
+  # categorical counts
+  cat_fun <- function(x, type){stringr::str_c(sum(x == type), " (", round(sum(x == type)/length(x)*100,2), "%)")}
+  sum_fun <- function(x){stringr::str_c(sum(x), " (", round(sum(x)/length(x)*100,2), "%)")}
+  
+  Losses <- tapply(GHS1$Trial.Type, GHS1$Sequence, cat_fun, type = "Losses")
+  LDWs <- tapply(GHS1$Trial.Type, GHS1$Sequence, cat_fun, type = "Losses Disguised as Wins")
+  Wins <- tapply(GHS1$Trial.Type, GHS1$Sequence, cat_fun, type = "Wins")
+  bet_switches <- tapply(GHS1$Next.Bet.Changed, GHS1$Sequence, sum_fun)
+  exceed_bonus <- tapply(GHS1$Bonus.Exceeded, GHS1$Sequence, sum_fun)
+  
+  # Continuous variables
+  cont_fun <- function(x){stringr::str_c(round(mean(x, na.rm = TRUE),2), " (", 
+                                         round(sd(x, na.rm = TRUE),2), ")")}
+  bal_fun <- function(x) {return(stringr::str_c(round(mean(x, na.rm = TRUE),2), " (", 
+                                                round(sd(x, na.rm = TRUE),2), ")"))}
+  sess_fun <- function(x) {return(stringr::str_c(round(mean(x, na.rm = TRUE)/60,2), " (", 
+                                                 round(sd(x, na.rm = TRUE)/60,2), ")"))}
+  
+  SIL.avg <- tapply(GHS1$Time.Until.Next.Bet, GHS1$Sequence, cont_fun)
+  bet_denom.avg <- tapply(GHS1$Bet.Denomination, GHS1$Sequence, cont_fun)
+  lines.avg <- tapply(GHS1$Lines, GHS1$Sequence, cont_fun)
+  bet_size.avg <- tapply(GHS1$Round.Bet, GHS1$Sequence, cont_fun)
+  cred_bal.avg <- tapply(GHS1$Round.End.Balance , GHS1$Sequence, cont_fun)
+  loss_streak.avg <- tapply(lossdata$Loss.Streak.Outcome...Zero, lossdata$Session, cont_fun)
+  win_mag.avg <- tapply(windata$Result, windata$Session, cont_fun)
+  
+  bal <- (tapply(GHS1_sum$Round.End.Balance, list(GHS1_sum$Participant.ID, GHS1_sum$Session, GHS1_sum$Sequence.Version), 
+                 function(x){tail(x, n = 1)}))
+  final_bal <- c(bal_fun(bal[,,"A"]), bal_fun(bal[,,"B"]), bal_fun(bal[,,"C"]))
+  
+  lengths <- tapply(GHS1_sum$Time.Elapsed, list(GHS1_sum$Participant.ID, GHS1_sum$Session,GHS1_sum$Sequence.Version), 
+                    function(x){tail(x, n = 1)})
+  session_length <- c(sess_fun(lengths[,,"A"]), sess_fun(lengths[,,"B"]), sess_fun(lengths[,,"C"]))
+  
+  sequences <- rbind(c(""),
+                     t(Losses), t(LDWs), t(Wins), t(bet_switches), t(exceed_bonus),
+                     c(""),
+                     t(SIL.avg), t(bet_denom.avg), t(lines.avg), 
+                     t(bet_size.avg), t(loss_streak.avg), t(win_mag.avg), 
+                     t(cred_bal.avg), t(final_bal), t(session_length))
+  
+  colnames(sequences) <- c(stringr::str_c("A (n = ", session_n[1], ")"), 
+                           stringr::str_c("B (n = ", session_n[2], ")"), 
+                           stringr::str_c("C (n = ", session_n[3], ")"))
+  
+  rownames(sequences) <- c("Categorical Variable Counts and Percentages", 
+                           "Losses", "Losses Disguised as Wins", "Wins", "Bet Switches", "Credits Exceeded $15 Bonus",
+                           "Numeric Variable Means and Standard Deviations",
+                           "Spin Initiation Latency (sec)", "Bet Denomination (credits)", "Lines Played", 
+                           "Total Bet Size (credits)", "Loss Streak Length", "Win Magnitude (credits)", 
+                           "Credit Balance", "Final Credit Balance","Session Length (min)")
+  
+  return(sequences)
+}
+
+sequences <- sequence_descriptives()
+print(xtable::xtable(sequences), type = "html", file = "results/sequences.html")
+
+```
+
+
+## Spin Initiation Latency omnibus model
+
+```{r SIL overall data visualization and descriptives}
+
+# spin latency
+statVisual::LinePlot(GHS1_trim, x = 'Initiated.Trial.Number.cent', y = 'Time.Until.Next.Bet',
+                     sid = 'Participant.ID', group = 'Session')
+
+sessionDesc(GHS1_trim, "Time.Until.Next.Bet", "Session") # before log transform
+psych::describeBy(GHS1_trim$Time.Until.Next.Bet, GHS1_trim$Session, mat = TRUE)
+
+sessionDesc(GHS1_trim, "Time.Until.Next.Bet.log", "Session") # after log transform
+psych::describeBy(GHS1_trim$Time.Until.Next.Bet.log, GHS1_trim$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(GHS1_trim, "Round.End.Balance", "Session")
+psych::describeBy(GHS1_trim$Round.End.Balance, GHS1_trim$Session, mat = TRUE)
+
+```
+
+
+```{r SIL omnibus model}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(GHS1_trim[,c("Initiated.Trial.Number.cent", "Session.cent", "Round.End.Balance.gmc")])
+
+lm(Time.Until.Next.Bet.log ~ Participant.f 
+   + Initiated.Trial.Number.cent 
+   + Session.cent 
+   + Round.End.Balance.gmc
+   , data = GHS1_trim, na.action = na.exclude) %>% 
+  performance::check_collinearity() %>% print() %>% plot()
+
+# Fixed effects OLS regression
+SIL_fe <- glm(Time.Until.Next.Bet.log ~ Participant.f
+              + Initiated.Trial.Number.cent*Session.cent
+              + Next.Bet.Changed
+              + Round.End.Balance.gmc
+              + Sequence.Version
+              + Trial.Type
+              - 1, data = GHS1_trim, na.action = na.exclude)
+
+# OLS Diagnostics
+diagnostics(SIL_fe, wide = TRUE) 
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+SIL_fe_rob_noint <- robustbase::lmrob(update(formula(SIL_fe), ~ . - Initiated.Trial.Number.cent:Session.cent), 
+                                      GHS1_trim, na.action = na.exclude, 
+                                      control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust model
+SIL_fe_rob <- robustbase::lmrob(formula(SIL_fe), GHS1_trim, na.action = na.exclude, 
+                                control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust diagnostics
+robmodel_weights(GHS1_trim, SIL_fe_rob, 'ISI')
+robust_diagnostics(SIL_fe, SIL_fe_rob)
+
+# print all results
+if (!file.exists("results/SIL_all_trials")) {dir.create("results/SIL_all_trials")}
+sjPlot::tab_model(SIL_fe_rob_noint, SIL_fe_rob, SIL_fe,
+                  dv.labels = dv_labels, digits = 6, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Spin Initiation Latency (All Trials)", file = "results/SIL_all_trials/all_results.html")
+
+# plot robust model results
+SIL_grid <- expand.grid(Participant.f = levels(factor(GHS1_trim$Participant.ID)),
+                        Initiated.Trial.Number.cent = c(-100,-75,-50,-25,0,25,50,75,100),
+                        Session.cent = c(-1,1),
+                        Next.Bet.Changed = c(0,1),
+                        Round.End.Balance.gmc = c(0),
+                        Sequence.Version = factor(c("A","B","C")),
+                        Trial.Type = factor(c("Losses","Losses Disguised as Wins","Wins")))
+
+SIL_grid$predicted.probs <- predict(SIL_fe_rob, SIL_grid, type = "response")
+
+SIL_grid_summary <- SIL_grid %>% group_by(Initiated.Trial.Number.cent, Session.cent, Trial.Type) %>%
+  summarise(avg = mean(predicted.probs))
+
+SIL_plot <- ggplot(SIL_grid_summary, aes(x = Initiated.Trial.Number.cent, y = avg,
+                                         color = factor(Session.cent),
+                                         linetype = factor(Session.cent))) +
+  geom_line(size = 1) + facet_grid(cols = vars(Trial.Type)) +
+  ylab("Spin Initiation Latency (log)") + xlab("Trial Number") +
+  scale_colour_manual(name = "Session", values = c("#29BF12","#00A5CF","#574AE2"), labels = c("1", "3")) +
+  scale_linetype_manual(name = "Session", values = c(1,2,4), labels = c("1", "3")) +
+  scale_x_continuous(labels = c(0,50,100,150,200))
+
+SIL_plot
+ggsave(filename = 'results/SIL_all_trials/plot_SIL_fe_rob.png', plot = SIL_plot, dpi = 1200, width = 8, height = 2.5)
+
+```
+
+
+## Bet Change omnibus model
+
+```{r Bet change overall data visualization and descriptives}
+
+# Check whether each participant made bet changes
+change_count <- aggregate(Next.Bet.Changed ~ Participant.f + Session, data = GHS1, function(x) {sum(x == 1)})
+sessionDesc(change_count, "Next.Bet.Changed", "Session")
+psych::describeBy(change_count$Next.Bet.Changed, change_count$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(GHS1, "Round.End.Balance", "Session")
+psych::describeBy(GHS1$Round.End.Balance, GHS1$Session, mat = TRUE)
+
+```
+
+
+```{r Bet change omnibus model}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(GHS1[,c("Initiated.Trial.Number.cent", "Session.cent", "Round.End.Balance.gmc")])
+
+glm(Next.Bet.Changed ~ Participant.f 
+    + Initiated.Trial.Number.cent 
+    + Session.cent 
+    + Round.End.Balance.gmc
+    , data = GHS1, family = binomial(), na.action = na.exclude) %>%
+  performance::check_collinearity() %>% print() %>% plot()
+
+# Fixed effects OLS regression
+change_fe <- glm(Next.Bet.Changed ~ Participant.f
+                 + Initiated.Trial.Number.cent*Session.cent
+                 + Round.End.Balance.gmc
+                 + Sequence.Version
+                 + Trial.Type
+                 - 1, data = GHS1, family = binomial(), na.action = na.exclude)
+
+# OLS diagnostics
+diagnostics(change_fe) 
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+change_fe_rob_noint <- robustbase::glmrob(update(formula(change_fe), ~ . - Initiated.Trial.Number.cent:Session.cent),
+                                          family = binomial, data = GHS1, na.action = na.exclude, method = "Mqle")
+
+# Robust model
+change_fe_rob <- robustbase::glmrob(formula(change_fe), family = binomial, data = GHS1, 
+                                    na.action = na.exclude, method = "Mqle")
+
+# Robust diagnostics
+robmodel_weights(GHS1, change_fe_rob, 'BET')
+robust_diagnostics(change_fe, change_fe_rob)
+
+# print all results
+if (!file.exists("results/bet_change_all_trials")) {dir.create("results/bet_change_all_trials")}
+sjPlot::tab_model(change_fe_rob_noint, change_fe_rob, change_fe,
+                  dv.labels = dv_labels, digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (All Trials)", file = "results/bet_change_all_trials/all_results.html")
+
+# plot robust model results 
+change_grid <- expand.grid(Participant.f = levels(factor(GHS1$Participant.ID)),
+                           Initiated.Trial.Number.cent = c(-100,-75,-50,-25,0,25,50,75,100),
+                           Session.cent = c(-1,1),
+                           Round.End.Balance.gmc = c(0),
+                           Sequence.Version = factor(c("A","B","C")),
+                           Trial.Type = factor(c("Losses","Losses Disguised as Wins","Wins")))
+
+change_grid$predicted.probs <- predict(change_fe_rob, change_grid, type = "response")
+
+change_grid_summary <- change_grid %>% group_by(Initiated.Trial.Number.cent, Session.cent, Trial.Type) %>% 
+  summarise(avg = mean(predicted.probs))
+
+change_plot <- ggplot(change_grid_summary, aes(x = Initiated.Trial.Number.cent, y = avg, 
+                                               color = factor(Session.cent), 
+                                               linetype = factor(Session.cent))) +
+  geom_line(size = 1) + facet_grid(cols = vars(Trial.Type)) + 
+  ylab("Bet Switching (log odds)") + xlab("Trial Number") +
+  scale_colour_manual(name = "Session", values = c("#29BF12","#00A5CF","#574AE2"), labels = c("1", "3")) +
+  scale_linetype_manual(name = "Session", values = c(1,2,4), labels = c("1", "3")) +
+  scale_x_continuous(labels = c(0,50,100,150,200))
+
+change_plot
+ggsave(filename = 'results/bet_change_all_trials/plot_change_fe_rob.png', plot = change_plot, dpi = 1200, width = 8, height = 2.5)
+
+```
+
+
+## Combined plot for both omnibus models
+
+```{r omnibus plot}
+
+top_plot <- SIL_plot + ggplot2::theme_bw() +
+  theme(axis.text = element_text(colour = "black")) + 
+  theme(strip.text = element_text(size = 12)) + 
+  theme(text = element_text(family = "serif")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+bottom_plot <- change_plot + ggplot2::theme_bw() +
+  theme(axis.text = element_text(colour = "black")) + 
+  theme(strip.text = element_text(size = 12)) + 
+  theme(text = element_text(family = "serif")) + 
+  theme(strip.background = element_blank(), strip.text.x = element_blank())
+
+alltrial_plots <- ggpubr::ggarrange(top_plot, bottom_plot,
+                                    #labels = c("A", "B"),
+                                    ncol = 1, nrow = 2,
+                                    common.legend = TRUE, 
+                                    legend = "bottom") 
+alltrial_plots
+ggsave(filename = 'results/alltrial_plots.png', dpi = 1200, plot = alltrial_plots, width = 7.5, height = 4.5)
+
+```
+
+
+## 'Spin Initiation Latency after a Loss' model
+
+```{r SIL losses data visualization and descriptives}
+
+# spin initiation latency
+statVisual::LinePlot(lossdata_trim, x = 'Initiated.Trial.Number.cent', y = 'Time.Until.Next.Bet',
+                     sid = 'Participant.ID', group = 'Session')
+
+sessionDesc(lossdata_trim, "Time.Until.Next.Bet", "Session") # before log transform
+psych::describeBy(lossdata_trim$Time.Until.Next.Bet, lossdata_trim$Session, mat = TRUE)
+
+sessionDesc(lossdata_trim, "Time.Until.Next.Bet.log", "Session") # after log transform
+psych::describeBy(lossdata_trim$Time.Until.Next.Bet.log, lossdata_trim$Session, mat = TRUE)
+
+# loss streak
+sessionDesc(lossdata_trim, "Loss.Streak.Outcome...Zero", "Session") # before log transform
+psych::describeBy(lossdata_trim$Loss.Streak.Outcome...Zero, lossdata_trim$Session, mat = TRUE)
+
+sessionDesc(lossdata_trim, "Loss.Streak.Outcome...Zero.log", "Session") # after log transform
+psych::describeBy(lossdata_trim$Loss.Streak.Outcome...Zero.log, lossdata_trim$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(lossdata_trim, "Round.End.Balance", "Session")
+psych::describeBy(lossdata_trim$Round.End.Balance, lossdata_trim$Session, mat = TRUE)
+
+```
+
+
+```{r SIL losses only models}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(lossdata_trim[,c("Initiated.Trial.Number.cent", "Session.cent", 
+                      "Loss.Streak.Outcome...Zero.log.gmc", "Round.End.Balance.gmc")])
+
+lm(Time.Until.Next.Bet.log ~ Participant.f
+   + Initiated.Trial.Number.cent
+   + Session.cent
+   + Loss.Streak.Outcome...Zero.log.gmc
+   + Round.End.Balance.gmc
+   , data = lossdata_trim, na.action = na.exclude) %>%
+  performance::check_collinearity() %>% print() %>%  plot()
+
+# Fixed effects OLS regression
+losses_SIL_fe <- glm(Time.Until.Next.Bet.log ~ Participant.f
+                     + Initiated.Trial.Number.cent*Session.cent*Loss.Streak.Outcome...Zero.log.gmc
+                     + Next.Bet.Changed
+                     + Round.End.Balance.gmc
+                     + Sequence.Version
+                     - 1, data = lossdata_trim, na.action = na.exclude)
+
+ # OLS diagnostics
+diagnostics(losses_SIL_fe, wide = TRUE)
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+losses_SIL_fe_rob_noint <- update(formula(losses_SIL_fe), ~ . 
+                                  - Initiated.Trial.Number.cent:Session.cent:Loss.Streak.Outcome...Zero.log.gmc 
+                                  - Initiated.Trial.Number.cent:Session.cent
+                                  - Initiated.Trial.Number.cent:Loss.Streak.Outcome...Zero.log.gmc
+                                  - Session.cent:Loss.Streak.Outcome...Zero.log.gmc) %>%
+  robustbase::lmrob(., lossdata_trim, na.action = na.exclude, 
+                    control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust model
+losses_SIL_fe_rob <- robustbase::lmrob(formula(losses_SIL_fe), lossdata_trim, na.action = na.exclude, 
+                                        control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust diagnostics
+robmodel_weights(lossdata_trim, losses_SIL_fe_rob,'ISI')
+robust_diagnostics(losses_SIL_fe, losses_SIL_fe_rob)
+
+# print all results
+if (!file.exists("results/SIL_losses")) {dir.create("results/SIL_losses")}
+sjPlot::tab_model(losses_SIL_fe_rob_noint, losses_SIL_fe_rob, losses_SIL_fe,
+                  dv.labels = dv_labels, digits = 6, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Spin Initiation Latency (Losses Only)", file = "results/SIL_losses/all_results.html")
+
+# Recentering models
+losses_SIL_fe_rob_one <- term_replacer("Session.cent", "Session.one", losses_SIL_fe_rob)
+losses_SIL_fe_rob_three <- term_replacer("Session.cent", "Session.three", losses_SIL_fe_rob)
+
+# print recentering results
+sjPlot::tab_model(losses_SIL_fe_rob_one, losses_SIL_fe_rob_three,
+                  dv.labels = c("Session 1", "Session 3"), show.se = TRUE, show.stat = TRUE,
+                  digits = 6, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Spin Initiation Latency (Losses Only)", file = "results/SIL_losses/recentering.html")
+
+```
+
+
+## 'Spin Initiation Latency after a Win' model
+
+```{r SIL win data visualization and descriptives}
+
+# spin latency
+statVisual::LinePlot(windata_trim, x = 'Initiated.Trial.Number.cent', y = 'Time.Until.Next.Bet',
+                     sid = 'Participant.ID', group = 'Session')
+
+sessionDesc(windata_trim, "Time.Until.Next.Bet", "Session") # before log transform
+psych::describeBy(windata_trim$Time.Until.Next.Bet, windata_trim$Session, mat = TRUE)
+
+sessionDesc(windata_trim, "Time.Until.Next.Bet.log", "Session") # after log transform
+psych::describeBy(windata_trim$Time.Until.Next.Bet.log, windata_trim$Session, mat = TRUE)
+
+# bet result
+sessionDesc(windata_trim, "Result", "Session") # before log transform
+psych::describeBy(windata_trim$Result, windata_trim$Session, mat = TRUE)
+
+sessionDesc(windata_trim, "Result.log", "Session") # after log transform
+psych::describeBy(windata_trim$Result.log, windata_trim$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(lossdata_trim, "Round.End.Balance", "Session")
+psych::describeBy(windata_trim$Round.End.Balance, windata_trim$Session, mat = TRUE)
+
+```
+
+
+```{r SIL wins only models}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(windata_trim[,c("Initiated.Trial.Number.cent", "Session.cent", "Result.log.gmc", "Round.End.Balance.gmc")])
+
+lm(Time.Until.Next.Bet.log ~ Participant.f
+   + Initiated.Trial.Number.cent
+   + Session.cent
+   + Result.log.gmc
+   + Round.End.Balance.gmc
+   , data = windata_trim, na.action = na.exclude) %>%
+  performance::check_collinearity() %>% print() %>%  plot()
+
+wins_SIL_fe <- glm(Time.Until.Next.Bet.log ~ Participant.f
+                   + Initiated.Trial.Number.cent*Session.cent*Result.log.gmc
+                   + Next.Bet.Changed
+                   + Round.End.Balance.gmc
+                   + Sequence.Version
+                   - 1, data = windata_trim, na.action = na.exclude)
+
+# OLS diagnostics
+diagnostics(wins_SIL_fe, wide = TRUE)
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+wins_SIL_fe_rob_noint <- update(formula(wins_SIL_fe), ~ . 
+                                - Initiated.Trial.Number.cent:Session.cent:Result.log.gmc
+                                - Initiated.Trial.Number.cent:Session.cent
+                                - Initiated.Trial.Number.cent:Result.log.gmc
+                                - Session.cent:Result.log.gmc) %>%
+  robustbase::lmrob(., windata_trim, na.action = na.exclude, 
+                    control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust model
+wins_SIL_fe_rob <- robustbase::lmrob(formula(wins_SIL_fe), windata_trim, na.action = na.exclude, 
+                                      control = robustbase::lmrob.control(fast.s.large.n = Inf, setting = "KS2014"))
+
+# Robust diagnostics
+robmodel_weights(windata_trim, wins_SIL_fe_rob, 'ISI')
+robust_diagnostics(wins_SIL_fe, wins_SIL_fe_rob)
+
+# print all results
+if (!file.exists("results/SIL_wins")) {dir.create("results/SIL_wins")}
+sjPlot::tab_model(wins_SIL_fe_rob_noint, wins_SIL_fe_rob, wins_SIL_fe,
+                  dv.labels = dv_labels, digits = 6, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Spin Initiation Latency (Wins Only)", file = "results/SIL_wins/all_results.html")
+
+# Recentering models
+wins_SIL_fe_rob_one <- term_replacer("Session.cent", "Session.one", wins_SIL_fe_rob)
+wins_SIL_fe_rob_three <- term_replacer("Session.cent", "Session.three", wins_SIL_fe_rob)
+
+# print recentering results
+sjPlot::tab_model(wins_SIL_fe_rob_one, wins_SIL_fe_rob_three,
+                  dv.labels = c("Session 1", "Session 3"), show.se = TRUE, show.stat = TRUE,
+                  digits = 6, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Spin Initiation Latency (Wins Only)", file = "results/SIL_wins/recentering.html")
+
+```
+
+
+## 'Bet Switching after a Loss' model
+
+```{r Bet changes loss data visualization and descriptives}
+
+# Check whether each participant made bet changes
+change_count_losses <- aggregate(Next.Bet.Changed ~ Participant.f + Session, data = lossdata, function(x) {sum(x > 0)})
+sessionDesc(change_count_losses, "Next.Bet.Changed", "Session")
+psych::describeBy(change_count_losses$Next.Bet.Changed, change_count_losses$Session, mat = TRUE)
+
+# loss streak
+sessionDesc(lossdata, "Loss.Streak.Outcome...Zero", "Session") # before log transform
+psych::describeBy(lossdata$Loss.Streak.Outcome...Zero, lossdata$Session, mat = TRUE)
+
+sessionDesc(lossdata, "Loss.Streak.Outcome...Zero.log", "Session") # after log transform
+psych::describeBy(lossdata$Loss.Streak.Outcome...Zero.log, lossdata$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(lossdata, "Round.End.Balance", "Session")
+psych::describeBy(lossdata$Round.End.Balance, lossdata$Session, mat = TRUE)
+
+```
+
+
+```{r Bet changes losses only models}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(lossdata[,c("Initiated.Trial.Number.cent", "Session.cent", 
+                "Loss.Streak.Outcome...Zero.log.gmc", "Round.End.Balance.gmc")])
+
+glm(Next.Bet.Changed ~ Participant.f
+    + Initiated.Trial.Number.cent
+    + Session.cent
+    + Loss.Streak.Outcome...Zero.log.gmc
+    + Round.End.Balance.gmc
+    , data = lossdata, family = binomial(), na.action = na.exclude) %>%
+  performance::check_collinearity() %>% print() %>% plot()
+
+# Fixed effects OLS regression
+losses_change_fe <- glm(Next.Bet.Changed ~ Participant.f
+                        + Initiated.Trial.Number.cent*Session.cent*Loss.Streak.Outcome...Zero.log.gmc
+                        + Round.End.Balance.gmc
+                        + Sequence.Version
+                        - 1, data = lossdata, family = binomial(), na.action = na.exclude)
+
+# OLS diagnostics
+diagnostics(losses_change_fe)
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+losses_change_fe_rob_noint <- update(formula(losses_change_fe), ~ . 
+                                     - Initiated.Trial.Number.cent:Session.cent:Loss.Streak.Outcome...Zero.log.gmc 
+                                     - Initiated.Trial.Number.cent:Session.cent
+                                     - Initiated.Trial.Number.cent:Loss.Streak.Outcome...Zero.log.gmc
+                                     - Session.cent:Loss.Streak.Outcome...Zero.log.gmc) %>% 
+  robustbase::glmrob(., family = binomial, data = lossdata, na.action = na.exclude, method = "Mqle")
+
+# Robust model
+losses_change_fe_rob <- robustbase::glmrob(formula(losses_change_fe), family = binomial, 
+                                           data = lossdata, na.action = na.exclude, method = "Mqle")
+
+# Robust diagnostics
+robmodel_weights(lossdata, losses_change_fe_rob, 'BET')
+robust_diagnostics(losses_change_fe, losses_change_fe_rob)
+
+# print all results
+if (!file.exists("results/bet_change_losses")) {dir.create("results/bet_change_losses")}
+sjPlot::tab_model(losses_change_fe_rob_noint, losses_change_fe_rob, losses_change_fe,
+                  dv.labels = dv_labels, digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (Losses Only)", file = "results/bet_change_losses/all_results.html")
+
+# Recentering models
+losses_change_fe_rob_one <- term_replacer("Session.cent", "Session.one", losses_change_fe_rob)
+losses_change_fe_rob_three <- term_replacer("Session.cent", "Session.three", losses_change_fe_rob)
+
+losses_change_fe_rob_50 <- term_replacer("Initiated.Trial.Number.cent", "Initiated.Trial.Number.50", losses_change_fe_rob)
+losses_change_fe_rob_150 <- term_replacer("Initiated.Trial.Number.cent", "Initiated.Trial.Number.150", losses_change_fe_rob)
+
+# print recentering results
+sjPlot::tab_model(losses_change_fe_rob_one, losses_change_fe_rob_three,
+                  dv.labels = c("Session 1", "Session 3"), show.se = TRUE, show.stat = TRUE,
+                  digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (Losses Only)", file = "results/bet_change_losses/recentering_session.html")
+
+sjPlot::tab_model(losses_change_fe_rob_50, losses_change_fe_rob, losses_change_fe_rob_150,
+                  dv.labels = c("Trial 50", "100", "Trial 150"), show.se = TRUE, show.stat = TRUE,
+                  digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (Losses Only)", file = "results/bet_change_losses/recentering_trials.html")
+
+```
+
+
+## 'Bet Switching after a Win' model
+
+```{r Bet changes win data visualization and descriptives}
+
+# Check whether each participant made bet changes
+change_count_wins <- aggregate(Next.Bet.Changed ~ Participant.f + Session, data = windata, function(x) {sum(x > 0)})
+sessionDesc(change_count_wins, "Next.Bet.Changed", "Session")
+psych::describeBy(change_count_wins$Next.Bet.Changed, change_count_wins$Session, mat = TRUE)
+
+# bet result
+sessionDesc(windata, "Result", "Session") # before log transform
+psych::describeBy(windata$Result, windata$Session, mat = TRUE)
+
+sessionDesc(windata, "Result.log", "Session") # after log transform
+psych::describeBy(windata$Result.log, windata$Session, mat = TRUE)
+
+# round end balance
+sessionDesc(lossdata, "Round.End.Balance", "Session")
+psych::describeBy(windata$Round.End.Balance, windata$Session, mat = TRUE)
+
+```
+
+
+```{r Bet changes wins only models}
+
+# Multicolinearity checks (this check should not include interactions or categorical predictors)
+cor(windata[,c("Initiated.Trial.Number.cent", "Session.cent", "Result.log.gmc", "Round.End.Balance.gmc")])
+
+glm(Next.Bet.Changed ~ Participant.f
+    + Initiated.Trial.Number.cent
+    + Session.cent
+    + Result.log.gmc
+    + Round.End.Balance.gmc
+    , data = windata, family = binomial(), na.action = na.exclude) %>%
+  performance::check_collinearity() %>% print() %>% plot()
+
+# Fixed effects OLS regression
+wins_change_fe <- glm(Next.Bet.Changed ~ Participant.f
+                      + Initiated.Trial.Number.cent*Session.cent*Result.log.gmc
+                      + Round.End.Balance.gmc
+                      + Sequence.Version
+                      - 1, data = windata, family = binomial(), na.action = na.exclude)
+# OLS Diagnostics
+diagnostics(wins_change_fe)
+
+### ROBUST MODELS ###
+
+# Robust model (no interactions) 
+wins_change_fe_rob_noint <- update(formula(wins_change_fe), ~ . 
+                                   - Initiated.Trial.Number.cent:Session.cent:Result.log.gmc
+                                   - Initiated.Trial.Number.cent:Session.cent
+                                   - Initiated.Trial.Number.cent:Result.log.gmc
+                                   - Session.cent:Result.log.gmc) %>%
+  robustbase::glmrob(., family = binomial, data = windata, na.action = na.exclude, method = "Mqle")
+
+# Robust model
+wins_change_fe_rob <- robustbase::glmrob(formula(wins_change_fe), family = binomial, data = windata, 
+                                         na.action = na.exclude, method = "Mqle")
+
+# Robust diagnostics
+robmodel_weights(windata, wins_change_fe_rob, 'BET')
+robust_diagnostics(wins_change_fe, wins_change_fe_rob)
+
+# print all results
+if (!file.exists("results/bet_change_wins")) {dir.create("results/bet_change_wins")}
+sjPlot::tab_model(wins_change_fe_rob_noint, wins_change_fe_rob, wins_change_fe,
+                  dv.labels = dv_labels, digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (Wins Only)", file = "results/bet_change_wins/all_results.html")
+
+# Recentering models
+wins_change_fe_rob_one <- term_replacer("Session.cent", "Session.one", wins_change_fe_rob)
+wins_change_fe_rob_three <- term_replacer("Session.cent", "Session.three", wins_change_fe_rob)
+
+# print all results
+sjPlot::tab_model(wins_change_fe_rob_one, wins_change_fe_rob_three,
+                  dv.labels = c("Session 1", "Session 3"), show.se = TRUE, show.stat = TRUE,
+                  digits = 5, rm.terms = sprintf("Participant.f [%s]", seq(1,60)),
+                  title = "Bet Changes (Wins Only)", file = "results/bet_change_wins/recentering.html")
+
+```
+
+
+## Results Tables
+
+```{r}
+
+tab_alltrials <- function() {
+
+  SIL_labels = c("Trial Number", "Session", "Bet Change", "Credit Balance (log)", "Sequence B", 
+                 "Sequence C", "Loss Disguised as Win", "Win", "Trial Number x Session")
+  
+  change_labels = SIL_labels[!SIL_labels %in% "Bet Change"]
+  
+  all1 <- tab_formatter(SIL_fe_rob, preds = SIL_labels, sf = 2)
+  all2 <- tab_formatter(change_fe_rob, preds = change_labels, sf = 5)
+  merge_all <- merge(all1, all2, by = "Predictors", all = TRUE, sort = FALSE)
+  merge_all <- merge_all[c(1,2,10,3,4,5,6,7,8,9),]
+  
+  all_result <- merge_all %>% 
+    htmlTable::addHtmlTableStyle(align = "lccrccr", align.header = "lccrccr") %>% 
+    htmlTable::htmlTable(., cgroup = c("", "Spin Initiation Latency (log)", "Bet Switching"), 
+                         n.cgroup = c(1,3,3), rnames = FALSE)
+  
+  readr::write_file(all_result, "results/alltrials_models.html")
+  return(all_result)
+}
+
+tab_alltrials()
+
+
+tab_winloss <- function() {
+
+  wins_SIL_labels = c("Trial Number", "Session", "Win Magnitude (log)", "Bet Change", "Credit Balance (log)", 
+                  "Sequence B", "Sequence C","Trial Number x Session", "Trial Number x Win Magnitude (log)", 
+                  "Session x Win Magnitude (log)", "Trial Number x Session x Win Magnitude (log)")
+  
+  wins_change_labels = wins_SIL_labels[!wins_SIL_labels %in% "Bet Change"]
+  
+  loss_SIL_labels = c("Trial Number", "Session", "Loss Streak (log)", "Bet Change", "Credit Balance (log)", 
+                  "Sequence B", "Sequence C", "Trial Number x Session", "Trial Number x Loss Streak (log)", 
+                  "Session x Loss Streak (log)", "Trial Number x Session x Loss Streak (log)")
+  
+  loss_change_labels = loss_SIL_labels[!loss_SIL_labels %in% "Bet Change"]
+  
+  tab1 <- tab_formatter(wins_SIL_fe_rob, preds = wins_SIL_labels, sf = 2)
+  tab2 <- tab_formatter(wins_change_fe_rob, preds = wins_change_labels, sf = 5)
+  tab3 <- tab_formatter(losses_SIL_fe_rob, preds = loss_SIL_labels, sf = 2)
+  tab4 <- tab_formatter(losses_change_fe_rob, preds = loss_change_labels, sf = 5)
+  
+  merge1 <- merge(tab1, tab2, by = "Predictors", all = TRUE, sort = FALSE)
+  merge2 <- merge(tab3, tab4, by = "Predictors", all = TRUE, sort = FALSE)
+  
+  merge <- merge(merge1, merge2, by = "Predictors", all = TRUE, sort = FALSE)
+  merge <- merge[c(1,2,8,3,4,5,6,11,12,9,10,15,16,13,14,7),]
+    
+  result <- merge %>% 
+    htmlTable::addHtmlTableStyle(align = "lccrccrccrccr", align.header = "lccrccrccrccr") %>% 
+    htmlTable::htmlTable(., cgroup = c("", "Spin Initiation Latency after a Win", "Bet Switching after a Win", 
+                                       "Spin Initiation Latency after a Loss", "Bet Switching after a Loss"), 
+                         n.cgroup = c(1,3,3,3,3), rnames = FALSE)
+  
+  readr::write_file(result, "results/winloss_models.html")
+  return(result)
+}
+
+tab_winloss()
+
+```
+
