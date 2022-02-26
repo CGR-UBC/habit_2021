@@ -11,6 +11,7 @@ editor_options:
 
 library(dplyr)
 library(ggplot2)
+library(lme4)
 source("habit_functions.R")
 
 setwd("C:/") # set to the working directory
@@ -80,6 +81,11 @@ for (i in c(1, 2, 3)) {
   print(paste("Trials trimmed from session", i, "=",  
               round((sum(GHS1$Session == i) - sum(GHS1_trim$Session == i)) / sum(GHS1$Session == i) * 100, 2), "%"))
   }
+
+# calculate percentage of trimmed trials below 250ms
+paste("% trimmed trials below 250ms:", round((nrow(subset(GHS1_trim, Time.Until.Next.Bet < .250))) / nrow(GHS1_trim) * 100, 2), "%")
+paste("% trimmed win trials below 250ms:", round((nrow(subset(windata_trim, Time.Until.Next.Bet < .250))) / nrow(windata_trim) * 100, 2), "%")
+paste("% trimmed loss trials below 250ms:", round((nrow(subset(lossdata_trim, Time.Until.Next.Bet < .250))) / nrow(lossdata_trim) * 100, 2), "%")
 
 # Grand mean centering (GMC)
 GHS1 <- GHS1 %>% mutate(Round.End.Balance.gmc = Round.End.Balance - mean(Round.End.Balance, na.rm = TRUE))
@@ -251,6 +257,67 @@ sequence_descriptives <- function() {
 
 sequences <- sequence_descriptives()
 print(xtable::xtable(sequences), type = "html", file = "results/sequences.html")
+
+```
+
+
+## PGSI and GAM Descriptives / Analysis
+
+```{r}
+
+# create the PGSI table
+reshape(GHS1, idvar = "Participant.ID", timevar = "Session", direction = "wide")[, "S1.PGSI.1"] %>% table()
+
+if (!file.exists("results/GAM")) {dir.create("results/GAM")}
+
+# create a new data frame to test changes in GAM
+GAM <- reshape(GHS1, idvar = "Participant.ID", 
+               timevar = "Session", 
+               direction = "wide", 
+               v.names = "GAM")[, c("Participant.ID", "GAM.1", "GAM.2", "GAM.3")]
+
+GAM_long <- reshape(GAM, idvar = "Participant.ID", 
+                    direction = "long", 
+                    timevar = "Session", 
+                    varying = list(c("GAM.1", "GAM.2", "GAM.3")))
+
+GAM_long$Session.f <- factor(GAM_long$Session)
+GAM_long$time <- GAM_long$Session - 1
+
+# test for GAM changes using simple linear model
+gam_lm <- lm(GAM.1 ~ factor(Session), data = GAM_long)
+sjPlot::tab_model(gam_lm)
+sjPlot::plot_model(gam_lm, type = "pred")
+car::Anova(gam_lm, type = "III")
+
+# tests non-robust multilevel model fit
+gam_lmer.1 <- lmerTest::lmer(GAM.1 ~ 1 + (1 | Participant.ID), data = GAM_long)
+gam_lmer.2 <- lmerTest::lmer(GAM.1 ~ time + (1 | Participant.ID), data = GAM_long)
+gam_lmer.3 <- lmerTest::lmer(GAM.1 ~ time + (0 + time | Participant.ID), data = GAM_long)
+gam_lmer.4 <- lmerTest::lmer(GAM.1 ~ time + (time | Participant.ID), data = GAM_long)
+gam_lmer.5 <- lmerTest::lmer(GAM.1 ~ Session.f + (1 | Participant.ID), data = GAM_long)
+
+anova(gam_lmer.1, gam_lmer.2, gam_lmer.3, gam_lmer.4, gam_lmer.5)
+anova(gam_lmer.4, gam_lmer.5) # model 4 & 5 appear similar
+
+sjPlot::tab_model(gam_lmer.4)
+sjPlot::plot_model(gam_lmer.4, type = "pred")
+
+sjPlot::tab_model(gam_lmer.5)
+sjPlot::plot_model(gam_lmer.5, type = "pred")
+
+# diagnostics for non-robust models
+performance::check_model(gam_lmer.4, panel = FALSE) # several diagnostics issues
+performance::check_model(gam_lmer.5, panel = FALSE) # performs better
+
+# robust model
+gam_lmer.6 <- robustlmm::rlmer(GAM.1 ~ Session.f + (1 | Participant.ID), data = GAM_long)
+
+sjPlot::tab_model(gam_lmer.6, digits.p = 2, title = "Gambling Attitude Measure", file = "results/GAM/GAM_results.html")
+sjPlot::plot_model(gam_lmer.6, type = "pred")
+
+# robust model diagnostics
+print(plot(gam_lmer.6), ask = FALSE)
 
 ```
 
