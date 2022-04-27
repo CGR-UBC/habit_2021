@@ -223,16 +223,14 @@ sequence_descriptives <- function() {
   lines.avg <- tapply(GHS1$Lines, GHS1$Sequence, cont_fun)
   bet_size.avg <- tapply(GHS1$Round.Bet, GHS1$Sequence, cont_fun)
   cred_bal.avg <- tapply(GHS1$Round.End.Balance , GHS1$Sequence, cont_fun)
-  loss_streak.avg <- tapply(lossdata$Loss.Streak.Outcome...Zero, lossdata$Session, cont_fun)
-  win_mag.avg <- tapply(windata$Result, windata$Session, cont_fun)
+  loss_streak.avg <- tapply(lossdata$Loss.Streak.Outcome...Zero, lossdata$Sequence, cont_fun)
+  win_mag.avg <- tapply(windata$Result, windata$Sequence, cont_fun)
   
-  bal <- (tapply(GHS1_sum$Round.End.Balance, list(GHS1_sum$Participant.ID, GHS1_sum$Session, GHS1_sum$Sequence.Version), 
-                 function(x){tail(x, n = 1)}))
-  final_bal <- c(bal_fun(bal[,,"A"]), bal_fun(bal[,,"B"]), bal_fun(bal[,,"C"]))
+  bal <- (tapply(GHS1_sum$Round.End.Balance, list(GHS1_sum$Participant.ID, GHS1_sum$Sequence.Version), function(x){tail(x, n = 1)}))
+  final_bal <- c(bal_fun(bal[,"A"]), bal_fun(bal[,"B"]), bal_fun(bal[,"C"]))
   
-  lengths <- tapply(GHS1_sum$Time.Elapsed, list(GHS1_sum$Participant.ID, GHS1_sum$Session,GHS1_sum$Sequence.Version), 
-                    function(x){tail(x, n = 1)})
-  session_length <- c(sess_fun(lengths[,,"A"]), sess_fun(lengths[,,"B"]), sess_fun(lengths[,,"C"]))
+  lengths <- tapply(GHS1_sum$Time.Elapsed, list(GHS1_sum$Participant.ID, GHS1_sum$Sequence.Version), function(x){tail(x, n = 1)})
+  session_length <- c(sess_fun(lengths[,"A"]), sess_fun(lengths[,"B"]), sess_fun(lengths[,"C"]))
   
   sequences <- rbind(c(""),
                      t(Losses), t(LDWs), t(Wins), t(bet_switches), t(exceed_bonus),
